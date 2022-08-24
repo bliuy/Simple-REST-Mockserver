@@ -1,0 +1,21 @@
+{
+    "http_request": {
+        "method": "GET",
+        "unique_key": "12345",
+        "request_config": {
+            "headers": {
+                "header_1" : "header_1_value",
+                "header_2" : "header_2_value"
+            },
+            "body": "{\"body_1\": \"body_1_value\",\"body_2\": \"body_2_value\"}"
+        }
+    },
+    "http_response": {
+        "status_code": 200,
+        "headers": {
+            "response_header_1": "response_header_1_value",
+            "response_header_2": "response_header_2_value"
+        },
+        "body": "{\"response_body_1\": \"response_body_1_value\",\"response_body_2\": \"response_body_2_value\"}"
+    }
+}
