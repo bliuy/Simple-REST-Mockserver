@@ -12,10 +12,12 @@
     },
     "http_response": {
         "status_code": 200,
-        "headers": {
-            "response_header_1": "response_header_1_value",
-            "response_header_2": "response_header_2_value"
-        },
-        "body": "{\"response_body_1\": \"response_body_1_value\",\"response_body_2\": \"response_body_2_value\"}"
+        "response_config": {
+            "headers": {
+                "response_header_1": "response_header_1_value",
+                "response_header_2": "response_header_2_value"
+            },
+            "body": "{\"response_body_1\": \"response_body_1_value\",\"response_body_2\": \"response_body_2_value\"}"
+        }
     }
 }
