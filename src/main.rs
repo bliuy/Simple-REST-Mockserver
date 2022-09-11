@@ -2,9 +2,9 @@ use std::cell::Cell;
 
 use actix_web::{
     web::{self, Json},
-    App, Either, HttpRequest, HttpResponse, HttpServer, Responder,
+    App, Either, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError,
 };
-use anyhow::Result;
+use errors::ResponseErrors;
 use redis::{
     aio::{Connection, ConnectionManager},
     AsyncCommands,
@@ -103,121 +103,156 @@ async fn poll(
     app_data: actix_web::web::Data<AppData>,
     unique_key_path: web::Path<String>,
     request: HttpRequest,
-) -> impl Responder {
-    // General configuration
+) -> Result<HttpResponse, ResponseErrors> {
+    // Setup
     let unique_key = unique_key_path.into_inner();
     let redis_conn = &mut app_data.redis_conn.clone();
 
-    // Getting the corresponding data tied to the unique key within the Redis environment
-    let request_method: Option<String> =
-        match redis_conn.hget(&unique_key, "request_method").await.ok() {
-            Some(redis_response) if redis_response != redis::Value::Nil => {
-                let redis_response: redis::Value = redis_response;
-                redis::FromRedisValue::from_redis_value(&redis_response).ok()
+    // Validating the request method
+    redis_conn
+        .hget(&unique_key, "request_method")
+        .await
+        .map_err(|e| ResponseErrors::RedisError(format!("{}", e)))
+        .map(|i| -> Result<String, ResponseErrors> {
+            let _: redis::Value = i;
+            redis::FromRedisValue::from_redis_value(&i)
+                .map_err(|e| ResponseErrors::RedisError(format!("{}", e)))
+        })?
+        .map(|i| -> Result<String, ResponseErrors> {
+            if i != request.method().as_str() {
+                return Err(ResponseErrors::IncorrectHttpMethod(
+                    i,
+                    request.method().as_str().to_owned(),
+                ));
             }
-            _ => None,
-        };
+            Ok(i)
+        })??;
 
-    // Validating that the method call used aligns with what was specified during the registration process.
-    match request_method {
-        Some(i) => {
-            if request.method().as_str() != i {
-                return HttpResponse::MethodNotAllowed().finish();
+    // Getting the registered request configuration
+    // The configuration indicates how the incoming request should be structured.
+    // If the incoming request matches the registered configuration, the corresponding registered response will be returned.
+    let registered_request_configuration = redis_conn
+        .hget(&unique_key, "request_config")
+        .await
+        .map_err(|e| ResponseErrors::RedisError(format!("{}", e)))
+        .map(|i| -> Result<redis::Value, _> {
+            if i == redis::Value::Nil {
+                return Err(ResponseErrors::RedisNilValue);
             }
-        }
-        None => match redis_conn.exists(&unique_key).await {
-            Ok(i) if i == 1 => {
-                let _: i8 = i;
-                return HttpResponse::NotFound().finish();
-            }
-            _ => return HttpResponse::InternalServerError().finish(),
-        },
+            Ok(i)
+        })?
+        .map(|i| -> Result<String, _> {
+            redis::FromRedisValue::from_redis_value(&i)
+                .map_err(|e| ResponseErrors::RedisConversionError(e.to_string()))
+        })?
+        .map(|i| -> Result<serde_json::Value, _> {
+            serde_json::from_str(&i)
+                .map_err(|e| ResponseErrors::SerdeJsonConversionError(e.to_string()))
+        })??;
+
+    // Validating headers - Checking if all the header fields in the registration config is found in the current request
+    let registered_headers = registered_request_configuration
+        .get("headers")
+        .ok_or(ResponseErrors::MissingInformation(
+            "'headers' field is missing from the Redis dataset.".to_owned(),
+        ))
+        .map(|i| {
+            i.as_object().ok_or(ResponseErrors::RedisConversionError(
+                "Cannot convert registered headers to Map object".to_owned(),
+            ))
+        })??;
+
+    for (header_name, header_val) in registered_headers.iter() {
+        request
+            .headers()
+            .get(header_name)
+            .ok_or(ResponseErrors::IncorrectDetails(format!(
+                "Missing the following header: {}",
+                header_name
+            )))
+            .map(|i| -> Result<(), ResponseErrors> {
+                let registered_value =
+                    header_val
+                        .as_str()
+                        .ok_or(ResponseErrors::RedisConversionError(
+                            "Cannot convert header to String object".to_owned(),
+                        ))?;
+                let current_value = i.to_str().map_err(|_| {
+                    ResponseErrors::RedisConversionError(
+                        "Unable to convert header value to String".to_owned(),
+                    )
+                })?;
+                if registered_value != current_value {
+                    return Err(ResponseErrors::PlaceholderError);
+                }
+                Ok(())
+            })??;
     }
 
-    // Getting + deserializing the "request_config" field.
-    let request_config: Option<serde_json::Value> =
-        match redis_conn.hget(&unique_key, "request_config").await.ok() {
-            Some(redis_response) if redis_response != redis::Value::Nil => {
-                if let Some(i) = redis::FromRedisValue::from_redis_value(&redis_response).ok() {
-                    let _: String = i;
-                    serde_json::from_str::<'_, serde_json::Value>(&i).ok()
-                } else {
-                    None
-                }
+    // Constructing the response
+    // Validation has been completed in the prior steps
+
+    let registered_response = redis_conn
+        .hget(&unique_key, "response_config")
+        .await
+        .map_err(|e| ResponseErrors::RedisError(format!("{}", e)))
+        .map(|i| -> Result<redis::Value, _> {
+            if i == redis::Value::Nil {
+                return Err(ResponseErrors::RedisNilValue);
             }
-            _ => None,
-        };
+            Ok(i)
+        })?
+        .map(|i| -> Result<String, _> {
+            redis::FromRedisValue::from_redis_value(&i)
+                .map_err(|e| ResponseErrors::RedisConversionError(e.to_string()))
+        })?
+        .map(|i| -> Result<serde_json::Value, _> {
+            serde_json::from_str(&i)
+                .map_err(|e| ResponseErrors::SerdeJsonConversionError(e.to_string()))
+        })??;
 
-    // Error handling
-    let request_config = match request_config {
-        Some(i) => i,
-        None => return HttpResponse::InternalServerError().finish(),
-    };
+    let registered_response_headers = registered_response
+        .get("headers")
+        .ok_or(ResponseErrors::RedisError(
+            "'headers' field is missing from the 'response_config' section.".to_owned(),
+        ))
+        .map(|i| {
+            i.as_object().ok_or(ResponseErrors::RedisConversionError(
+                "Cannot convert registered headers to Map object".to_owned(),
+            ))
+        })??;
 
-    // Validating headers - Checking if the current request headers has a corresponding match in the registered header
-    let registered_headers = request_config.get("headers").unwrap();
-    for (header_name, header_value) in request.headers().iter() {
-        match registered_headers.get(header_name.as_str()) {
-            Some(registered_header_value) => {
-                if registered_header_value.is_string() {
-                    match registered_header_value.as_str().unwrap()
-                        == &String::from_utf8(header_value.as_bytes().to_vec()).unwrap()
-                    {
-                        true => {}
-                        false => return HttpResponse::BadRequest().finish(),
-                    }
-                }
-            }
-            None => return HttpResponse::NotFound().finish(),
-        };
-    }
-
-    // Creating the payload to be send as a response
-    let response_config: Option<serde_json::Value> =
-        match redis_conn.hget(&unique_key, "response_config").await.ok() {
-            Some(redis_response) if redis_response != redis::Value::Nil => {
-                let redis_response: redis::Value = redis_response;
-                if let Some(i) = redis::FromRedisValue::from_redis_value(&redis_response).ok() {
-                    let _: String = i;
-                    serde_json::from_str::<'_, serde_json::Value>(&i).ok()
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-    // Error handling
-    let response_config = match response_config {
-        Some(i) => i,
-        None => return HttpResponse::InternalServerError().finish(),
-    };
-
-    // Constructing the HTTP response
-    let response_body = response_config
+    let registered_response_body = registered_response
         .get("body")
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_string();
-    let response_headers = serde_json::from_str::<serde_json::Value>(
-        response_config.get("body").unwrap().as_str().unwrap(),
-    )
-    .unwrap();
+        .ok_or(ResponseErrors::RedisError(
+            "'body' field is missing from the 'response_config' section.".to_owned(),
+        ))
+        .map(|i| {
+            i.as_str().ok_or(ResponseErrors::RedisConversionError(
+                "Cannot convert registered body to String object".to_owned(),
+            ))
+        })??;
 
     let mut response = HttpResponse::Ok();
-    for (k, v) in response_headers.as_object().unwrap().iter() {
-        let key = k.clone();
-        let val = v.as_str().unwrap().to_string();
-        response.append_header((key, val));
+    for (k, v) in registered_response_headers.iter() {
+        let header_pair = (
+            k.clone(),
+            v.as_str()
+                .ok_or(ResponseErrors::RedisConversionError(
+                    "Cannot convert registered header to String object".to_owned(),
+                ))?
+                .to_owned(),
+        );
+        response.append_header(header_pair);
     }
 
-    response.body(response_body)
+    let final_response = response.body(registered_response_body.to_owned());
 
+    Ok(final_response)
 }
 
 #[actix_web::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     // Creating the async connection instance to the Redis backend
     let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
     // let redis_client = redis::Client::open("localhost:6379")?;
@@ -237,9 +272,9 @@ async fn main() -> Result<()> {
                 web::resource("/poll/{unique_key}").route(
                     web::route()
                         .guard(actix_web::guard::Get())
-                        .guard(actix_web::guard::Put())
-                        .guard(actix_web::guard::Post())
-                        .guard(actix_web::guard::Patch())
+                        // .guard(actix_web::guard::Put())
+                        // .guard(actix_web::guard::Post())
+                        // .guard(actix_web::guard::Patch())
                         .to(poll),
                 ),
             )
