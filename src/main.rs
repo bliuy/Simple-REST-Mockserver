@@ -87,7 +87,7 @@ async fn register(
         };
 
     // Constructing the required pipeline
-    let result: Result<i8, redis::RedisError> = redis::Pipeline::new()
+    let result: Result<(i8, i8, i8), redis::RedisError> = redis::Pipeline::new()
         .atomic()
         .hset_nx(unique_key, "request_config", request_config_serialized)
         .hset_nx(unique_key, "request_method", request_method)
@@ -95,7 +95,7 @@ async fn register(
         .query_async(redis_conn)
         .await;
 
-    HttpResponse::Ok().body(format!("{}", result.unwrap()))
+    HttpResponse::Ok().finish()
 }
 
 // #[actix_web::get("/poll/{unique_key}")]
@@ -254,7 +254,7 @@ async fn poll(
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
     // Creating the async connection instance to the Redis backend
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let redis_client = redis::Client::open("redis://172.18.0.2:6379")?;
     // let redis_client = redis::Client::open("localhost:6379")?;
     let redis_conn = ConnectionManager::new(redis_client).await?;
 
@@ -279,7 +279,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
             )
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(("0.0.0.0", 8080))?
     .run()
     .await?;
 
